@@ -211,6 +211,12 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
     if (!output)  throw std::runtime_error("Output pointer is null");
     if (!output_transit_buffer_)
         throw std::runtime_error("Output transit buffer is null");
+    if (bytes > output_transit_buffer_size_) {
+        fprintf(stderr, "PE %d: copy_output_to_user: bytes %zu > buffer size %zu\n",
+                myPe_, bytes, output_transit_buffer_size_);
+        throw std::runtime_error("Output copy failed: buffer too small");
+    }
+    if (bytes == 0) return;
 
     hipError_t err = stream
         ? hipMemcpyAsync(output, output_transit_buffer_, bytes,
@@ -218,6 +224,11 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
         : hipMemcpy(output, output_transit_buffer_, bytes,
                     hipMemcpyDeviceToDevice);
     if (err != hipSuccess) {
+        // 4-byte types: some ROCm drivers fail async copy with hipErrorInvalidValue; fallback to sync
+        if (sizeof(T) == 4 && err == hipErrorInvalidValue && stream != nullptr) {
+            err = hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
+            if (err == hipSuccess) return;
+        }
         fprintf(stderr, "PE %d: copy_output_to_user failed: %s\n",
                 myPe_, hipGetErrorString(err));
         throw std::runtime_error("Output copy failed");
@@ -230,6 +241,13 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
     try {
+        size_t required_output_size = total_count * dtype_size_;
+        if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
+                                output_transit_buffer_size_, output_transit_buffer_obj_,
+                                required_output_size, "output transit buffer")) {
+            return false;
+        }
+
         // Step 1: SdmaReduceScatter — SDMA scatter + local reduce
         constexpr int pack_size = packed_t<T>::P::size;
         int threads = 512;
@@ -271,6 +289,17 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
         // Step 3: Copy result to user buffer
         if (copy_output_to_user_) {
+            // 4-byte types (uint32_t, float): sync stream before copy so kernel completes before
+            // hipMemcpyAsync; avoids driver issues in DDP (gradient buffer + current stream). fp16/bf16
+            // (2 bytes) are not affected in practice.
+            if (sizeof(T) == 4 && stream != nullptr) {
+                hipError_t sync_err = hipStreamSynchronize(stream);
+                if (sync_err != hipSuccess) {
+                    fprintf(stderr, "PE %d: hipStreamSynchronize before copy failed: %s\n",
+                            myPe_, hipGetErrorString(sync_err));
+                    return false;
+                }
+            }
             copy_output_to_user(output, total_count, stream);
         }
 

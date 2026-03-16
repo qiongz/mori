@@ -270,7 +270,7 @@ class AllreduceSdma:
     _HANDLE_MAP = {
         torch.uint32: "AllreduceSdmaHandle",
         torch.int32: "AllreduceSdmaHandle",
-        torch.float32: "AllreduceSdmaHandle",
+        torch.float32: "AllreduceSdmaHandleFp32",
         torch.float16: "AllreduceSdmaHandleFp16",
         torch.bfloat16: "AllreduceSdmaHandleBf16",
     }
@@ -293,7 +293,7 @@ class AllreduceSdma:
             copy_output_to_user: If True, copy output_transit_buffer to user output buffer (default True).
                                 If False, user should directly use output_transit_buffer via get_output_transit_buffer()
             dtype: Data type for the allreduce operation (default torch.uint32).
-                   Supported: torch.uint32, torch.int32, torch.float16, torch.bfloat16
+                   Supported: torch.uint32, torch.int32, torch.float32, torch.float16, torch.bfloat16
             mode: Kept for backward compatibility — ignored.  SDMA transport
                   reads the user input directly; no eager/graph distinction.
         """

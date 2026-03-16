@@ -34,13 +34,15 @@ def _verify_allreduce_result(data_cpu, elems, my_pe, npes, label="", dtype=torch
     first_n = min(elems, len(data_cpu))
     chunk = data_cpu[:first_n]
 
-    if dtype in (torch.float16, torch.bfloat16):
+    if dtype in (torch.float16, torch.bfloat16, torch.float32):
         expected_arr = np.full(first_n, expected_value, dtype=np.float32)
         chunk_f = chunk.astype(np.float32)
-        if np.allclose(chunk_f, expected_arr, rtol=1e-2, atol=1.0):
+        rtol = 1e-5 if dtype == torch.float32 else 1e-2
+        atol = 0.01 if dtype == torch.float32 else 1.0
+        if np.allclose(chunk_f, expected_arr, rtol=rtol, atol=atol):
             return True
         else:
-            mismatches = np.where(~np.isclose(chunk_f, expected_arr, rtol=1e-2, atol=1.0))[0]
+            mismatches = np.where(~np.isclose(chunk_f, expected_arr, rtol=rtol, atol=atol))[0]
             print(f"  PE {my_pe} [{label}]: FAILED! Expected ~{expected_value}, "
                   f"got {len(mismatches)} mismatches in first {first_n} elements. "
                   f"First mismatch at idx {mismatches[0]}: {chunk[mismatches[0]]}")
@@ -164,7 +166,7 @@ def _test_outplace(rank, my_pe, npes, elems, data_bytes, output_buf_size,
                                   f"outplace/{dtype_name}", dtype=dtype)
 
     out_cpu = _to_numpy(output_tensor.cpu())
-    zero_check = (np.allclose(out_cpu, 0)
+    zero_check = (np.allclose(out_cpu, 0, atol=1e-5)
                   if dtype not in (torch.uint32, torch.int32)
                   else np.all(out_cpu == 0))
     if zero_check and rank == 0:
@@ -232,6 +234,8 @@ def _rccl_verify(cpu_data, elems, npes, rccl_dtype, rank, label):
     if rccl_dtype in (torch.float16, torch.bfloat16):
         ok = np.allclose(cpu_data[:first_n].astype(np.float32),
                          expected_value, rtol=1e-2, atol=1.0)
+    elif rccl_dtype == torch.float32:
+        ok = np.allclose(cpu_data[:first_n], expected_value, rtol=1e-5, atol=0.01)
     else:
         ok = np.all(cpu_data[:first_n] == expected_value)
     if rank == 0:
@@ -249,7 +253,7 @@ def _test_rccl_outplace(rank, my_pe, npes, elems, data_bytes,
         print(f"\n>>> Test 3: RCCL out-of-place (torch.distributed, "
               f"{dtype_name}→{rccl_dtype_name})")
 
-    rccl_fill = float(fill_value) if rccl_dtype in (torch.float16, torch.bfloat16) else fill_value
+    rccl_fill = float(fill_value) if rccl_dtype in (torch.float16, torch.bfloat16, torch.float32) else fill_value
 
     input_tensor = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
     output_tensor = torch.zeros(elems, dtype=rccl_dtype, device=device)
@@ -298,7 +302,7 @@ def _test_rccl_inplace(rank, my_pe, npes, elems, data_bytes,
         print(f"\n>>> Test 4: RCCL in-place (torch.distributed, "
               f"{dtype_name}→{rccl_dtype_name})")
 
-    rccl_fill = float(fill_value) if rccl_dtype in (torch.float16, torch.bfloat16) else fill_value
+    rccl_fill = float(fill_value) if rccl_dtype in (torch.float16, torch.bfloat16, torch.float32) else fill_value
 
     inplace_tensor = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
 
@@ -411,6 +415,8 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup,
 _DTYPE_MAP = {
     "uint32": torch.uint32,
     "int32": torch.int32,
+    "fp32": torch.float32,
+    "float32": torch.float32,
     "fp16": torch.float16,
     "float16": torch.float16,
     "bf16": torch.bfloat16,
@@ -431,6 +437,12 @@ def test_allreduce(elems=67108864, world_size=8, iterations=10, warmup=10,
     )
 
 
+def elems_from_size_mb(size_mb: int, dtype: torch.dtype) -> int:
+    """Elements per rank for a given message size in MB."""
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    return (size_mb * 1024 * 1024) // elem_size
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -438,26 +450,35 @@ if __name__ == "__main__":
         description="Test AllReduce SDMA (correctness + bandwidth)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--elems", type=int, default=67108864, help="Elements per PE")
+    parser.add_argument("--elems", type=int, default=None, help="Elements per PE (overridden by --size-mb if set)")
+    parser.add_argument("--size-mb", type=int, default=1024,
+                        help="Message size per rank in MB (default 1024). Used to compute --elems when set.")
     parser.add_argument("--world-size", type=int, default=8, help="Number of processes")
     parser.add_argument("--iterations", type=int, default=10, help="Measurement iterations")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
     parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
-    parser.add_argument("--dtype", type=str, default="uint32",
+    parser.add_argument("--dtype", type=str, default="fp32",
                         choices=list(_DTYPE_MAP.keys()),
-                        help="Data type (uint32, fp16, bf16)")
+                        help="Data type (fp32, uint32, fp16, bf16)")
     args = parser.parse_args()
     os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
 
     dtype = _DTYPE_MAP[args.dtype]
     dtype_name = str(dtype).split('.')[-1]
 
+    if args.elems is not None:
+        elems = args.elems
+    else:
+        elems = elems_from_size_mb(args.size_mb, dtype)
+    args.elems = elems
+
     print(f"AllReduce SDMA Test")
+    print(f"  Dtype           : {dtype_name}")
+    print(f"  Size per rank   : {args.size_mb} MB")
     print(f"  Elements per PE : {args.elems:,}")
     print(f"  World size      : {args.world_size}")
     print(f"  Iterations      : {args.iterations}")
     print(f"  Warmup          : {args.warmup}")
-    print(f"  Dtype           : {dtype_name}")
     print("-" * 60)
 
     test_allreduce(args.elems, args.world_size, args.iterations, args.warmup, dtype)
