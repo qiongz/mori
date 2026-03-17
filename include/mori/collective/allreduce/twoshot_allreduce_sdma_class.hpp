@@ -27,6 +27,7 @@
 #include <mpi.h>
 #include <memory>
 #include <cstdint>
+#include <atomic>
 
 #include "mori/application/application.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -55,6 +56,12 @@ private:
     CrossPeBarrier* barrierPtr_;
     std::unique_ptr<void, ShmemDeleter> barrierMem_;
 
+    // Launch sync: npes uint32_t, GPU-side barrier when stream!=nullptr (NCCL-style,
+    // no CPU dist.barrier/MPI_Barrier). Ensures all PEs have launched before any proceeds.
+    std::unique_ptr<uint32_t[], ShmemDeleter> launch_ready_;
+    application::SymmMemObjPtr launch_ready_obj_;
+    std::atomic<uint32_t> launch_ready_epoch_;
+
     // Input transit buffer (symmetric memory for P2P reads)
     void* input_transit_buffer_;
     size_t input_transit_buffer_size_;
@@ -81,6 +88,9 @@ private:
     // Copy mode flag: if true, copy output_transit_buffer to user output buffer
     // if false, user should directly use output_transit_buffer
     bool copy_output_to_user_;
+
+    // For multi-bucket / consecutive calls: last completed invocation sequence (MORI_SDMA_MULTI_BUCKET=1)
+    mutable int my_last_completed_sequence_;
 
     AllreduceSdma(const AllreduceSdma&) = delete;
     AllreduceSdma& operator=(const AllreduceSdma&) = delete;
@@ -145,14 +155,18 @@ public:
     void cancel_async();
 
     /**
-     * @brief Executes in-place AllReduce SDMA operation (result overwrites input)
+     * @brief Executes in-place AllReduce SDMA operation (result overwrites input).
+     *        When MORI_SDMA_MULTI_BUCKET=1, invocations are serialized internally
+     *        (wait until all PEs finished the previous call) so different sizes
+     *        can be called consecutively like NCCL allreduce.
      * @param data Input/output data pointer (elementCount elements on each rank)
      * @param total_count Number of data elements per PE
      * @param stream HIP stream
      * @return true if successful, false if failed
-     * @note Synchronization must be handled by the caller
+     * @note Synchronization must be handled by the caller unless MORI_SDMA_BLOCKING=1
      */
     bool allreduce_inplace(T* data, size_t total_count, hipStream_t stream = nullptr);
+    bool allreduce_inplace_avg(T* data, size_t total_count, int world_size, hipStream_t stream = nullptr);
 
     application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
     void* getOutputTransitBuffer() const { return output_transit_buffer_; }

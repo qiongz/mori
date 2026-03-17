@@ -1,0 +1,35 @@
+# AllReduce bandwidth benchmark config
+# Compares MORI SDMA vs NCCL (RCCL) for in-place and out-of-place allreduce
+# fp32 data, bucket-cap-size from 1MB to 8192MB (2x sweep)
+
+# Message sizes per rank in MB (1, 2, 4, 8, ..., 8192)
+size_mb_sweep:
+  min_mb: 1
+  max_mb: 1024   # 8129MB -> use 8192 (2^13)
+  multiplier: 2
+
+# Data type
+dtype: fp32
+
+# Modes to benchmark (sync + async)
+modes:
+  # MORI sync
+  - mori_outplace      # MORI sync out-of-place (operator())
+  - mori_inplace       # MORI sync in-place (allreduce_inplace)
+  # MORI async (start_async/wait_async, DDP hook style)
+  - mori_async_outplace      # MORI async out-of-place, copy to user
+  - mori_async_outplace_nocopy  # MORI async out-of-place, use transit buffer
+  - mori_async_inplace_work  # MORI async in-place, work-handle (NCCL-like)
+  # NCCL
+  - nccl_outplace      # torch.distributed.all_reduce out-of-place
+  - nccl_inplace       # torch.distributed.all_reduce in-place
+
+# Run parameters
+world_size: 8
+iterations: 10
+warmup: 10
+
+# Output
+output_dir: .          # Directory for result JSON and plots
+plot_format: png      # png, pdf, svg
+plot_dpi: 150

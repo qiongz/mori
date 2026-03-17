@@ -26,10 +26,13 @@
 #include "mori/shmem/shmem.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
+#include <mpi.h>
 #include <stdexcept>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <type_traits>
 
 namespace mori {
 namespace collective {
@@ -72,7 +75,9 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
       async_total_count_(0),
       async_stream_(nullptr),
       async_start_time_(0.0),
-      copy_output_to_user_(copy_output_to_user) {
+      copy_output_to_user_(copy_output_to_user),
+      launch_ready_epoch_(0),
+      my_last_completed_sequence_(-1) {
 
     // 1. Allocate SDMA completion flags
     size_t flagsSize = npes_ * sizeof(uint64_t);
@@ -93,6 +98,16 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
     hipError_t me = hipMemset(bMem, 0, barrierSize);
     if (me != hipSuccess)
         throw std::runtime_error("Failed to zero-init barrier memory");
+
+    // 2.5. Allocate launch_ready (npes uint32_t) for GPU-side launch sync when stream!=nullptr
+    size_t launchReadySize = npes_ * sizeof(uint32_t);
+    void* lr = shmem::ShmemMalloc(launchReadySize);
+    if (!lr) throw std::runtime_error("Failed to allocate launch_ready memory");
+    launch_ready_.reset(static_cast<uint32_t*>(lr));
+    memset(launch_ready_.get(), 0, launchReadySize);
+    launch_ready_obj_ = shmem::ShmemQueryMemObjPtr(launch_ready_.get());
+    if (!launch_ready_obj_.IsValid())
+        throw std::runtime_error("Failed to get valid launch_ready memory object");
 
     // 3. Allocate output transit buffer (gather + reduce + allgather)
     output_transit_buffer_ = shmem::ShmemMalloc(output_transit_buffer_size_);
@@ -205,6 +220,9 @@ void AllreduceSdma<T>::copy_input_to_transit(T* input, size_t total_count, hipSt
 
 // copy_output_to_user implementation
 // For AllReduce: output is total_count elements (same size as input, NOT npes * total_count)
+// For large buffers (>256MB): chunked hipMemcpyAsync to avoid ROCm driver hang on single 1GB+ async copy
+constexpr size_t COPY_CHUNK_BYTES = 256 * 1024 * 1024;
+
 template <typename T>
 void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStream_t stream) {
     size_t bytes = total_count * dtype_size_;
@@ -218,20 +236,37 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
     }
     if (bytes == 0) return;
 
-    hipError_t err = stream
-        ? hipMemcpyAsync(output, output_transit_buffer_, bytes,
-                         hipMemcpyDeviceToDevice, stream)
-        : hipMemcpy(output, output_transit_buffer_, bytes,
-                    hipMemcpyDeviceToDevice);
-    if (err != hipSuccess) {
-        // 4-byte types: some ROCm drivers fail async copy with hipErrorInvalidValue; fallback to sync
-        if (sizeof(T) == 4 && err == hipErrorInvalidValue && stream != nullptr) {
-            err = hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
-            if (err == hipSuccess) return;
+    if (stream == nullptr) {
+        hipError_t err = hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
+        if (err != hipSuccess) {
+            fprintf(stderr, "PE %d: copy_output_to_user failed: %s\n",
+                    myPe_, hipGetErrorString(err));
+            throw std::runtime_error("Output copy failed");
         }
-        fprintf(stderr, "PE %d: copy_output_to_user failed: %s\n",
-                myPe_, hipGetErrorString(err));
-        throw std::runtime_error("Output copy failed");
+        return;
+    }
+
+    // Async path: chunk large copies to avoid ROCm driver hang on 1GB+ single hipMemcpyAsync
+    size_t offset = 0;
+    while (offset < bytes) {
+        size_t chunk = std::min(bytes - offset, COPY_CHUNK_BYTES);
+        hipError_t err = hipMemcpyAsync(
+            reinterpret_cast<char*>(output) + offset,
+            static_cast<const char*>(output_transit_buffer_) + offset,
+            chunk, hipMemcpyDeviceToDevice, stream);
+        if (err != hipSuccess) {
+            if (sizeof(T) == 4 && err == hipErrorInvalidValue) {
+                err = hipMemcpy(reinterpret_cast<char*>(output) + offset,
+                                static_cast<const char*>(output_transit_buffer_) + offset,
+                                chunk, hipMemcpyDeviceToDevice);
+            }
+            if (err != hipSuccess) {
+                fprintf(stderr, "PE %d: copy_output_to_user failed at offset %zu: %s\n",
+                        myPe_, offset, hipGetErrorString(err));
+                throw std::runtime_error("Output copy failed");
+            }
+        }
+        offset += chunk;
     }
 }
 
@@ -246,6 +281,34 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
                                 output_transit_buffer_size_, output_transit_buffer_obj_,
                                 required_output_size, "output transit buffer")) {
             return false;
+        }
+
+        // Step 0: Stream-ordered reset of SDMA flags.
+        // For async overlap, host memset may race with previous in-flight collective.
+        // Use same stream ordering to guarantee "reset happens after previous kernels".
+        hipError_t err = hipSuccess;
+        if (stream != nullptr) {
+            err = hipMemsetAsync(flags_.get(), 0, npes_ * sizeof(uint64_t), stream);
+            if (err != hipSuccess) {
+                fprintf(stderr, "PE %d: hipMemsetAsync(flags) failed: %s\n",
+                        myPe_, hipGetErrorString(err));
+                return false;
+            }
+        } else {
+            memset(flags_.get(), 0, npes_ * sizeof(uint64_t));
+        }
+
+        // Step 0.5: GPU-side launch sync when stream!=nullptr (NCCL-style, no CPU barrier).
+        // Ensures all PEs have launched before any SdmaReduceScatter proceeds.
+        if (stream != nullptr && launch_ready_ && launch_ready_obj_.IsValid()) {
+            const uint32_t launch_epoch = launch_ready_epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
+            LaunchSyncKernel<<<1, 1, 0, stream>>>(myPe_, npes_, launch_ready_obj_, launch_epoch);
+            err = hipGetLastError();
+            if (err != hipSuccess) {
+                fprintf(stderr, "PE %d: LaunchSyncKernel failed: %s\n",
+                        myPe_, hipGetErrorString(err));
+                return false;
+            }
         }
 
         // Step 1: SdmaReduceScatter — SDMA scatter + local reduce
@@ -265,12 +328,17 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             barrierPtr_,
             total_count);
 
-        hipError_t err = hipGetLastError();
+        err = hipGetLastError();
         if (err != hipSuccess) {
             fprintf(stderr, "PE %d: SdmaReduceScatter launch failed: %s\n",
                     myPe_, hipGetErrorString(err));
             return false;
         }
+
+        // Step 1.5: Flush L2 to HBM so AllGather SDMA reads fresh data.
+        // Must run after ReduceScatter completes (all blocks done) to avoid
+        // race where early blocks flush before late blocks finish (large msg bug).
+        FlushL2Kernel<<<1, 1, 0, stream>>>();
 
         // Step 2: AllGather via SDMA
         AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
@@ -289,10 +357,11 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
         // Step 3: Copy result to user buffer
         if (copy_output_to_user_) {
-            // 4-byte types (uint32_t, float): sync stream before copy so kernel completes before
-            // hipMemcpyAsync; avoids driver issues in DDP (gradient buffer + current stream). fp16/bf16
-            // (2 bytes) are not affected in practice.
-            if (sizeof(T) == 4 && stream != nullptr) {
+            // NCCL-style overlap: when stream!=nullptr, skip sync so C++ returns immediately after queueing.
+            // MORI_SDMA_DEFER_SYNC=1 时跳过，实现 overlap；默认保留 sync 保证稳定性。
+            const char* defer_sync = std::getenv("MORI_SDMA_DEFER_SYNC");
+            const bool skip_sync = (defer_sync && std::strchr(defer_sync, '1'));
+            if (!skip_sync && sizeof(T) == 4 && stream != nullptr) {
                 hipError_t sync_err = hipStreamSynchronize(stream);
                 if (sync_err != hipSuccess) {
                     fprintf(stderr, "PE %d: hipStreamSynchronize before copy failed: %s\n",
@@ -353,6 +422,9 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             barrierPtr_,
             total_count);
 
+        // Step 1.5: Flush L2 to HBM so AllGather SDMA reads fresh data (same as sync path).
+        FlushL2Kernel<<<1, 1, 0, stream>>>();
+
         // Step 2: AllGather PUT only — sends data, returns immediately
         // The wait is deferred to wait_async so the user can run GEMM on CU
         AllGatherAsyncPutKernel<T><<<1, 512, 0, stream>>>(
@@ -395,6 +467,16 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
 
         // Copy result to user buffer (if enabled)
         if (copy_output_to_user_) {
+            // 4-byte types (float): sync before copy, same as sync operator().
+            // Without this, copy mode fails (e.g. second half wrong) while non-copy passes.
+            if (sizeof(T) == 4 && wait_stream != nullptr) {
+                hipError_t sync_err = hipStreamSynchronize(wait_stream);
+                if (sync_err != hipSuccess) {
+                    fprintf(stderr, "PE %d: hipStreamSynchronize before copy failed: %s\n",
+                            myPe_, hipGetErrorString(sync_err));
+                    throw std::runtime_error("Stream sync before copy failed");
+                }
+            }
             copy_output_to_user(async_output_, async_total_count_, wait_stream);
         }
 
@@ -454,11 +536,88 @@ void AllreduceSdma<T>::cancel_async() {
 template <typename T>
 bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count,
                                           hipStream_t stream) {
+    const char* multi_bucket = std::getenv("MORI_SDMA_MULTI_BUCKET");
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    // Only use MPI-based serialization when MORI_SDMA_MULTI_BUCKET=1 AND MPI was already initialized (e.g. mpirun).
+    // With torchrun/other launchers MPI is not init; caller must use Python-side per-bucket sync instead.
+    const bool use_sequence = (multi_bucket && std::strchr(multi_bucket, '1') && mpi_initialized);
+
+    if (use_sequence) {
+        const int my_sequence = my_last_completed_sequence_ + 1;
+        int send_val = my_last_completed_sequence_;
+        int recv_val = -1;
+        while (true) {
+            int mpi_err = MPI_Allreduce(&send_val, &recv_val, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+            if (mpi_err != MPI_SUCCESS) {
+                fprintf(stderr, "PE %d: MORI_SDMA_MULTI_BUCKET MPI_Allreduce(MIN) failed: %d\n",
+                        myPe_, mpi_err);
+                return false;
+            }
+            if (recv_val >= my_sequence - 1)
+                break;
+        }
+    }
+
     bool saved = copy_output_to_user_;
     copy_output_to_user_ = true;
     bool ok = (*this)(data, data, total_count, stream);
     copy_output_to_user_ = saved;
-    return ok;
+
+    if (use_sequence)
+        my_last_completed_sequence_ = my_last_completed_sequence_ + 1;
+
+    if (!ok) return false;
+    // Optional: block until stream completes (drop-in compatible with torch.distributed.all_reduce)
+    const char* blocking = std::getenv("MORI_SDMA_BLOCKING");
+    if (blocking && std::strchr(blocking, '1')) {
+        if (stream != nullptr) {
+            hipError_t err = hipStreamSynchronize(stream);
+            if (err != hipSuccess) {
+                fprintf(stderr, "PE %d: MORI_SDMA_BLOCKING hipStreamSynchronize failed: %s\n",
+                        myPe_, hipGetErrorString(err));
+                return false;
+            }
+        } else {
+            hipError_t err = hipDeviceSynchronize();
+            if (err != hipSuccess) {
+                fprintf(stderr, "PE %d: MORI_SDMA_BLOCKING hipDeviceSynchronize failed: %s\n",
+                        myPe_, hipGetErrorString(err));
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+template <typename T>
+bool AllreduceSdma<T>::allreduce_inplace_avg(T* data, size_t total_count,
+                                             int world_size, hipStream_t stream) {
+    if (world_size <= 0) {
+        fprintf(stderr, "PE %d: invalid world_size=%d in allreduce_inplace_avg\n", myPe_, world_size);
+        return false;
+    }
+    if (!allreduce_inplace(data, total_count, stream)) {
+        return false;
+    }
+    if constexpr (std::is_same_v<T, float>) {
+        hipStream_t scale_stream = stream;
+        const int threads = 256;
+        const int blocks = std::min(max_blocks_, static_cast<int>((total_count + threads - 1) / threads));
+        const float inv = 1.0f / static_cast<float>(world_size);
+        ScaleFp32Kernel<<<std::max(1, blocks), threads, 0, scale_stream>>>(
+            reinterpret_cast<float*>(data), total_count, inv);
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            fprintf(stderr, "PE %d: ScaleFp32Kernel launch failed: %s\n",
+                    myPe_, hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    } else {
+        fprintf(stderr, "PE %d: allreduce_inplace_avg currently supports fp32 only\n", myPe_);
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------

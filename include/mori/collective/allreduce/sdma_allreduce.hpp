@@ -71,14 +71,20 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   }
   application::SymmMemObjPtr barrierObj =
       shmem::ShmemSymmetricRegister(barrierMem, barrierSize);
-  hipMemset(barrierMem, 0, barrierSize);
+  hipError_t memset_err = hipMemset(barrierMem, 0, barrierSize);
+  if (memset_err != hipSuccess) {
+    return -1;
+  }
 
   // Local barrier token for AllGather generation signaling.
   void* agBarrierMem = shmem::ShmemMalloc(sizeof(CrossPeBarrier));
   if (agBarrierMem == nullptr) {
     return -1;
   }
-  hipMemset(agBarrierMem, 0, sizeof(CrossPeBarrier));
+  memset_err = hipMemset(agBarrierMem, 0, sizeof(CrossPeBarrier));
+  if (memset_err != hipSuccess) {
+    return -1;
+  }
   CrossPeBarrier* agBarrier = reinterpret_cast<CrossPeBarrier*>(agBarrierMem);
 
   assert(inPutBuffObj.IsValid());

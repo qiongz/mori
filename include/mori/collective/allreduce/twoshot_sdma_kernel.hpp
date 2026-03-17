@@ -25,6 +25,7 @@
 #include <cstddef>
 
 #include "mori/shmem/shmem.hpp"
+#include "mori/core/utils.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/sdma/device_primitives.hpp"
 #include "mori/collective/intra_node/kernels/vec_type.cuh"
@@ -49,9 +50,15 @@ struct alignas(128) CrossPeBarrier {
 
 inline int getDeviceMaxBlocks() {
   int dev = 0;
-  hipGetDevice(&dev);
+  hipError_t e = hipGetDevice(&dev);
+  if (e != hipSuccess) {
+    return 80;
+  }
   hipDeviceProp_t prop;
-  hipGetDeviceProperties(&prop, dev);
+  e = hipGetDeviceProperties(&prop, dev);
+  if (e != hipSuccess) {
+    return 80;
+  }
   return (prop.multiProcessorCount > 0) ? prop.multiProcessorCount : 80;
 }
 
@@ -291,16 +298,62 @@ __global__ void SdmaReduceScatterKernel(
     }
     myDst[k] = downcast_v<typename P::type, pack_size>(acc);
   }
+  // NOTE: L2 flush (buffer_wbl2) moved to separate FlushL2Kernel launched
+  // after this kernel. Per-block flush caused race when multiple blocks
+  // wrote to output: early blocks could flush before late blocks finished,
+  // leading to stale/partial data in HBM for large messages (e.g. 262144 elems).
+}
 
-  // Flush dirty L2 lines to HBM so the SDMA-based AllGather reads fresh data.
-  // CU stores land in L2 (write-back); SDMA reads bypass L2 and hit HBM.
-  // buffer_wbl2 (CDNA3 / MI300, gfx94x) writes back ALL dirty L2 lines.
+// ============================================================================
+// LaunchSyncKernel — GPU-side launch barrier (NCCL-style, no CPU barrier)
+//
+// When using async/custom stream, PEs may launch at different times. CrossPeBarrier
+// in SdmaReduceScatter requires all PEs to have launched. This kernel ensures that:
+// each PE writes a monotonically increasing epoch token to launchReady[myPe],
+// then spins until all peers reach the same epoch.
+// Sync is inside the collective (like NCCL's implicit rendezvous), no dist.barrier.
+// ============================================================================
+__global__ void LaunchSyncKernel(int myPe, int npes,
+                                const application::SymmMemObjPtr launchReadyObj,
+                                uint32_t launchEpoch) {
+  if (npes <= 0 || launchReadyObj->localPtr == nullptr) return;
+  uint32_t* myBuf = reinterpret_cast<uint32_t*>(launchReadyObj->localPtr);
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    myBuf[myPe] = launchEpoch;
+    __threadfence_system();
+    for (int pe = 0; pe < npes; ++pe) {
+      uint32_t* peerBase =
+          reinterpret_cast<uint32_t*>(launchReadyObj->peerPtrs[pe]);
+      while (core::AtomicLoadRelaxedSystem(peerBase + pe) < launchEpoch) {
+      }
+    }
+  }
+}
+
+// ============================================================================
+// FlushL2Kernel — Write back dirty L2 lines to HBM before SDMA AllGather
+//
+// CU reduce writes land in L2 (write-back); SDMA reads bypass L2 and hit HBM.
+// Must run AFTER SdmaReduceScatterKernel completes (all blocks done) so that
+// all reduce writes have landed before we flush. Single-thread kernel is enough.
+// ============================================================================
+__global__ void FlushL2Kernel() {
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-  __syncthreads();
-  if (threadIdx.x == 0) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
     asm volatile("buffer_wbl2" ::: "memory");
   }
 #endif
+}
+
+// ============================================================================
+// ScaleFp32Kernel — in-place scaling on stream (for averaged allreduce)
+// ============================================================================
+__global__ void ScaleFp32Kernel(float* data, size_t count, float scale) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t i = idx; i < count; i += stride) {
+    data[i] = data[i] * scale;
+  }
 }
 
 // ============================================================================

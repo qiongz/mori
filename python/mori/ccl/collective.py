@@ -338,23 +338,87 @@ class AllreduceSdma:
         """
         return self._handle(input_data, output_data, count, stream)
 
-    def allreduce_inplace(self, data, count: int, stream=None) -> bool:
+    def allreduce_inplace(
+        self,
+        data,
+        count: int,
+        stream=None,
+        collective_id=None,
+        barrier_callback=None,
+    ) -> bool:
         """Execute in-place AllReduce SDMA operation (result overwrites input).
-        
+
+        For multiple consecutive calls (e.g. DDP multiple buckets), pass
+        collective_id (e.g. bucket index) and barrier_callback. MORI will call
+        barrier_callback(collective_id) before the C++ allreduce so the caller
+        can ensure "all ranks finished collective_id-1" before this collective.
+
         Args:
-            data: Input/output CUDA tensor (torch.int32 or torch.uint32, 1D, GPU memory).
-                  Contains `count` elements on this rank. After the operation, holds the
-                  element-wise sum across all ranks.
+            data: Input/output CUDA tensor (1D, GPU memory). After the op, holds
+                  the element-wise sum across all ranks.
             count: Number of elements per PE
             stream: Optional HIP stream
-            
+            collective_id: Optional id for this collective (e.g. bucket index).
+                           Used only when barrier_callback is also provided.
+            barrier_callback: Optional callable(collective_id). If provided with
+                              collective_id, called before the allreduce so the
+                              caller can synchronize (e.g. all_reduce(MIN) wait).
+
         Returns:
             True if successful, False if failed
-            
+
         Note:
-            Caller must handle synchronization (stream.synchronize() or torch.cuda.synchronize())
+            Caller must handle stream synchronization after return unless
+            MORI_SDMA_BLOCKING=1 is set.
         """
+        if collective_id is not None and callable(barrier_callback):
+            barrier_callback(collective_id)
         return self._handle.allreduce_inplace(data, count, stream)
+
+    def allreduce_inplace_async(
+        self,
+        data,
+        count: int,
+        stream=None,
+        collective_id=None,
+        barrier_callback=None,
+    ):
+        """Launch in-place allreduce and return MORI async work handle.
+
+        The returned handle provides `wait()`, `is_completed()`, and `result()`,
+        similar to torch/NCCL work style.
+        """
+        if collective_id is not None and callable(barrier_callback):
+            barrier_callback(collective_id)
+        if hasattr(self._handle, "allreduce_inplace_async"):
+            return self._handle.allreduce_inplace_async(data, count, stream)
+        ok = self._handle.allreduce_inplace(data, count, stream)
+        if not ok:
+            raise RuntimeError("MORI allreduce_inplace returned False")
+        return None
+
+    def allreduce_inplace_avg(
+        self,
+        data,
+        count: int,
+        world_size: int,
+        stream=None,
+        collective_id=None,
+        barrier_callback=None,
+    ) -> bool:
+        """In-place AllReduce + in-stream average (fp32 fast path).
+
+        Falls back to `allreduce_inplace` + `mul_(1/world_size)` when the
+        underlying handle does not expose `allreduce_inplace_avg`.
+        """
+        if collective_id is not None and callable(barrier_callback):
+            barrier_callback(collective_id)
+        if hasattr(self._handle, "allreduce_inplace_avg"):
+            return self._handle.allreduce_inplace_avg(data, count, world_size, stream)
+        ok = self._handle.allreduce_inplace(data, count, stream)
+        if ok:
+            data.mul_(1.0 / float(world_size))
+        return ok
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
         """Start asynchronous AllReduce SDMA operation.

@@ -22,6 +22,7 @@
 #include "src/pybind/mori.hpp"
 
 #include <cstdlib>
+#include <memory>
 #include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
@@ -84,6 +85,66 @@ static hipStream_t stream_for_allreduce_inplace(py::object stream_obj, int devic
     }
     return convert_torch_stream_to_hip(stream_obj, device_index);
 }
+
+class AllreduceSdmaWork {
+ public:
+  AllreduceSdmaWork(py::object tensor_ref, hipStream_t stream)
+      : tensor_ref_(std::move(tensor_ref)), event_(nullptr), finished_(false) {
+    hipError_t err = hipEventCreateWithFlags(&event_, hipEventDisableTiming);
+    if (err != hipSuccess) {
+      throw std::runtime_error(std::string("hipEventCreateWithFlags failed: ") + hipGetErrorString(err));
+    }
+    err = hipEventRecord(event_, stream);
+    if (err != hipSuccess) {
+      hipError_t destroy_err = hipEventDestroy(event_);
+      (void)destroy_err;
+      event_ = nullptr;
+      throw std::runtime_error(std::string("hipEventRecord failed: ") + hipGetErrorString(err));
+    }
+  }
+
+  ~AllreduceSdmaWork() {
+    if (event_ != nullptr) {
+      hipError_t destroy_err = hipEventDestroy(event_);
+      (void)destroy_err;
+      event_ = nullptr;
+    }
+  }
+
+  bool is_completed() {
+    if (finished_) {
+      return true;
+    }
+    hipError_t err = hipEventQuery(event_);
+    if (err == hipSuccess) {
+      finished_ = true;
+      return true;
+    }
+    if (err == hipErrorNotReady) {
+      return false;
+    }
+    throw std::runtime_error(std::string("hipEventQuery failed: ") + hipGetErrorString(err));
+  }
+
+  bool wait() {
+    if (finished_) {
+      return true;
+    }
+    hipError_t err = hipEventSynchronize(event_);
+    if (err != hipSuccess) {
+      throw std::runtime_error(std::string("hipEventSynchronize failed: ") + hipGetErrorString(err));
+    }
+    finished_ = true;
+    return true;
+  }
+
+  py::object result() const { return tensor_ref_; }
+
+ private:
+  py::object tensor_ref_;
+  hipEvent_t event_;
+  bool finished_;
+};
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
            torch::Tensor>
@@ -459,6 +520,18 @@ void RegisterMoriIo(pybind11::module_& m) {
 }
 
 void RegisterMoriCcl(pybind11::module_& m) {
+    py::class_<AllreduceSdmaWork, std::shared_ptr<AllreduceSdmaWork>>(m, "AllreduceSdmaWork")
+        .def("is_completed", &AllreduceSdmaWork::is_completed,
+             "Return whether the async allreduce has completed")
+        .def("wait",
+             [](AllreduceSdmaWork& self) -> bool {
+                 py::gil_scoped_release release;
+                 return self.wait();
+             },
+             "Wait for async allreduce completion")
+        .def("result", &AllreduceSdmaWork::result,
+             "Return associated tensor");
+
     // Bind All2allSdma class (uint32_t version)
     py::class_<mori::collective::All2allSdma<uint32_t>>(m, "All2allSdmaHandle")
         .def(py::init<int, int, size_t, size_t, bool>(),
@@ -1518,6 +1591,61 @@ void RegisterMoriCcl(pybind11::module_& m) {
             py::arg("count"),
             py::arg("stream") = py::none(),
             "Execute in-place AllReduce SDMA operation (fp32)")
+        .def("allreduce_inplace_async",
+            [](mori::collective::AllreduceSdma<float>& self,
+               const torch::Tensor& tensor,
+               size_t count,
+               py::object stream_obj) -> std::shared_ptr<AllreduceSdmaWork> {
+
+                if (tensor.dim() != 1) {
+                    throw std::runtime_error("Tensor must be 1-dimensional");
+                }
+                if (!tensor.is_cuda()) {
+                    throw std::runtime_error("Tensor must be CUDA tensor");
+                }
+                if (tensor.scalar_type() != torch::kFloat32) {
+                    throw std::runtime_error("Tensor must be float32");
+                }
+
+                float* ptr = tensor.data_ptr<float>();
+                int device_index = tensor.device().index();
+                hipStream_t stream = stream_for_allreduce_inplace(stream_obj, device_index);
+                bool ok = self.allreduce_inplace(ptr, count, stream);
+                if (!ok) {
+                    throw std::runtime_error("MORI allreduce_inplace(fp32) returned False");
+                }
+                return std::make_shared<AllreduceSdmaWork>(py::cast(tensor), stream);
+            },
+            py::arg("data"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Launch in-place AllReduce SDMA operation and return async work handle (fp32)")
+        .def("allreduce_inplace_avg",
+            [](mori::collective::AllreduceSdma<float>& self,
+               const torch::Tensor& tensor,
+               size_t count,
+               int world_size,
+               py::object stream_obj) -> bool {
+                if (tensor.dim() != 1) {
+                    throw std::runtime_error("Tensor must be 1-dimensional");
+                }
+                if (!tensor.is_cuda()) {
+                    throw std::runtime_error("Tensor must be CUDA tensor");
+                }
+                if (tensor.scalar_type() != torch::kFloat32) {
+                    throw std::runtime_error("Tensor must be float32");
+                }
+
+                float* ptr = tensor.data_ptr<float>();
+                int device_index = tensor.device().index();
+                hipStream_t stream = stream_for_allreduce_inplace(stream_obj, device_index);
+                return self.allreduce_inplace_avg(ptr, count, world_size, stream);
+            },
+            py::arg("data"),
+            py::arg("count"),
+            py::arg("world_size"),
+            py::arg("stream") = py::none(),
+            "Execute in-place AllReduce SDMA operation and scale by 1/world_size (fp32)")
         .def("start_async",
             [](mori::collective::AllreduceSdma<float>& self,
                const torch::Tensor& input_tensor, const torch::Tensor& output_tensor,

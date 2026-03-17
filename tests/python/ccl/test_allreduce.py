@@ -443,6 +443,12 @@ def elems_from_size_mb(size_mb: int, dtype: torch.dtype) -> int:
     return (size_mb * 1024 * 1024) // elem_size
 
 
+def elems_from_size_gb(size_gb: int, dtype: torch.dtype) -> int:
+    """Elements per rank for a given message size in GB."""
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    return (size_gb * 1024 * 1024 * 1024) // elem_size
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -450,9 +456,9 @@ if __name__ == "__main__":
         description="Test AllReduce SDMA (correctness + bandwidth)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--elems", type=int, default=None, help="Elements per PE (overridden by --size-mb if set)")
-    parser.add_argument("--size-mb", type=int, default=1024,
-                        help="Message size per rank in MB (default 1024). Used to compute --elems when set.")
+    parser.add_argument("--elems", type=int, default=None, help="Elements per PE (overridden by --size-mb/--size-gb if set)")
+    parser.add_argument("--size-mb", type=int, default=None, help="Message size per rank in MB (e.g. 1024). Single-test 1024MB.")
+    parser.add_argument("--size-gb", type=int, default=None, help="Message size per rank in GB (e.g. 26). Single-test 26GB.")
     parser.add_argument("--world-size", type=int, default=8, help="Number of processes")
     parser.add_argument("--iterations", type=int, default=10, help="Measurement iterations")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
@@ -468,13 +474,21 @@ if __name__ == "__main__":
 
     if args.elems is not None:
         elems = args.elems
-    else:
+        size_str = f"{args.elems * torch.tensor([], dtype=dtype).element_size() / (1024*1024):.2f} MB"
+    elif args.size_gb is not None:
+        elems = elems_from_size_gb(args.size_gb, dtype)
+        size_str = f"{args.size_gb} GB"
+    elif args.size_mb is not None:
         elems = elems_from_size_mb(args.size_mb, dtype)
+        size_str = f"{args.size_mb} MB"
+    else:
+        elems = elems_from_size_mb(1024, dtype)
+        size_str = "1024 MB (default)"
     args.elems = elems
 
     print(f"AllReduce SDMA Test")
     print(f"  Dtype           : {dtype_name}")
-    print(f"  Size per rank   : {args.size_mb} MB")
+    print(f"  Size per rank   : {size_str}")
     print(f"  Elements per PE : {args.elems:,}")
     print(f"  World size      : {args.world_size}")
     print(f"  Iterations      : {args.iterations}")
